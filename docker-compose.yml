@@ -1,0 +1,8 @@
+services:
+  sqlite-isolation:
+    build: .
+    ports:
+      - "8000:8000"
+    tmpfs:
+      - /data
+    restart: unless-stopped

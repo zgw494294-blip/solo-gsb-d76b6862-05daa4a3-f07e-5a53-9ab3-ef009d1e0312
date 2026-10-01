@@ -1,0 +1,689 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SQLite WAL 事务隔离实验</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --border: #d7dde5;
+      --text: #1f2937;
+      --muted: #64748b;
+      --blue: #2563eb;
+      --green: #15803d;
+      --red: #b91c1c;
+      --amber: #b45309;
+      --red-bg: #fef2f2;
+      --green-bg: #f0fdf4;
+      --amber-bg: #fffbeb;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      line-height: 1.5;
+    }
+
+    header {
+      padding: 28px clamp(16px, 4vw, 40px) 18px;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: clamp(24px, 4vw, 34px);
+      letter-spacing: -0.02em;
+    }
+
+    .subtitle {
+      margin: 0;
+      color: var(--muted);
+      max-width: 1050px;
+    }
+
+    main {
+      padding: 0 clamp(16px, 4vw, 40px) 32px;
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin: 12px 0 20px;
+      padding: 16px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+    }
+
+    button {
+      appearance: none;
+      border: 1px solid #94a3b8;
+      border-radius: 8px;
+      background: #fff;
+      color: var(--text);
+      padding: 8px 12px;
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.12s ease, border-color 0.12s ease, opacity 0.12s ease;
+    }
+
+    button:hover:not(:disabled) {
+      background: #f8fafc;
+      border-color: var(--blue);
+    }
+
+    button.primary {
+      border-color: var(--blue);
+      background: var(--blue);
+      color: #fff;
+    }
+
+    button.primary:hover:not(:disabled) { background: #1d4ed8; }
+
+    button.write { border-color: #0f766e; color: #0f766e; }
+    button.commit { border-color: var(--green); color: var(--green); }
+    button.rollback { border-color: var(--red); color: var(--red); }
+
+    button:disabled {
+      opacity: 0.48;
+      cursor: not-allowed;
+    }
+
+    .experiment-meta {
+      display: flex;
+      gap: 14px;
+      align-items: center;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 9px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: #f8fafc;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .pill.on {
+      border-color: #bbf7d0;
+      background: var(--green-bg);
+      color: var(--green);
+    }
+
+    .pill.off {
+      border-color: #e2e8f0;
+      background: #f8fafc;
+      color: var(--muted);
+    }
+
+    .pill.busy {
+      border-color: #fed7aa;
+      background: var(--amber-bg);
+      color: var(--amber);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
+
+    .monitor {
+      margin-bottom: 16px;
+      padding: 16px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 14px;
+      align-items: center;
+    }
+
+    .monitor h2, .pane h2 {
+      margin: 0 0 4px;
+      font-size: 18px;
+    }
+
+    .hint {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .committed-value, .read-value {
+      font-family: var(--mono);
+      font-size: 30px;
+      font-weight: 700;
+    }
+
+    .committed-value.unknown, .read-value.unknown {
+      font-family: inherit;
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--muted);
+    }
+
+    .pane {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      min-width: 0;
+    }
+
+    .pane-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: start;
+      margin-bottom: 14px;
+    }
+
+    .status-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .stat {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      background: #fbfdff;
+      min-width: 0;
+    }
+
+    .stat-label {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 2px;
+    }
+
+    .stat-value {
+      font-weight: 700;
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .add-row {
+      display: grid;
+      grid-template-columns: minmax(110px, 1fr) auto;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    input[type="number"] {
+      width: 100%;
+      border: 1px solid #94a3b8;
+      border-radius: 8px;
+      padding: 8px 10px;
+      font: inherit;
+    }
+
+    .error-box {
+      display: none;
+      border: 1px solid #fecaca;
+      background: var(--red-bg);
+      color: var(--red);
+      border-radius: 10px;
+      padding: 10px 12px;
+      margin: 0 0 12px;
+      white-space: pre-wrap;
+      font-family: var(--mono);
+      font-size: 13px;
+    }
+
+    .error-box.show { display: block; }
+
+    .error-box strong {
+      display: block;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin-bottom: 3px;
+    }
+
+    .logs {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      max-height: 275px;
+      overflow-y: auto;
+      background: #fcfcfd;
+    }
+
+    .logs li {
+      display: grid;
+      grid-template-columns: 62px 1fr;
+      gap: 8px;
+      padding: 8px 10px;
+      border-bottom: 1px solid #edf1f5;
+      font-size: 13px;
+    }
+
+    .logs li:last-child { border-bottom: 0; }
+    .logs time { color: var(--muted); font-family: var(--mono); }
+    .logs li.bad { background: var(--red-bg); }
+    .logs li.bad span { color: var(--red); }
+    .logs li.good span { color: #166534; }
+
+    .empty {
+      color: var(--muted);
+      padding: 12px;
+      font-size: 13px;
+    }
+
+    .examples {
+      margin: 18px 0 0;
+      padding: 16px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+    }
+
+    .examples h2 { margin: 0 0 8px; font-size: 18px; }
+    .examples ol { margin: 0; padding-left: 22px; }
+    .examples li { margin: 6px 0; }
+
+    @media (max-width: 900px) {
+      .grid { grid-template-columns: 1fr; }
+      .monitor { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>SQLite WAL 事务隔离实验</h1>
+    <p class="subtitle">
+      每次新建实验都会生成独立的 WAL 数据库和三条长期连接；甲、乙栏各持有一个连接，修改只能在显式事务中执行。
+    </p>
+  </header>
+
+  <main>
+    <section class="toolbar">
+      <button id="newExperiment" class="primary" type="button">新建实验</button>
+      <button id="refreshState" type="button" disabled>仅刷新状态（不读 SQLite）</button>
+      <div class="experiment-meta">
+        <span id="experimentState">尚未创建实验</span>
+        <span id="journalMode" class="pill off">journal_mode: 未初始化</span>
+      </div>
+    </section>
+
+    <section class="monitor">
+      <div>
+        <h2>第三条独立连接：已提交值</h2>
+        <div class="hint">此按钮才会用第三条 autocommit 连接执行 SELECT；刷新两栏状态不会额外读取，也不会替任何栏建立快照。</div>
+      </div>
+      <div style="text-align:right">
+        <div id="committedValue" class="committed-value unknown">未读取</div>
+        <button id="refreshCommitted" type="button" disabled>读取已提交值</button>
+      </div>
+    </section>
+
+    <div id="globalError" class="error-box" role="alert"></div>
+
+    <section class="grid">
+      <article class="pane" data-pane="a">
+        <div class="pane-head">
+          <h2>甲栏 / 连接 A</h2>
+          <span class="pill off transaction-badge">事务未开启</span>
+        </div>
+        <div class="status-row">
+          <div class="stat">
+            <span class="stat-label">最近一次显式读值</span>
+            <span class="read-value unknown">未读取</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">请求状态</span>
+            <span class="stat-value request-state">空闲</span>
+          </div>
+        </div>
+        <div class="controls">
+          <button class="begin" type="button">BEGIN DEFERRED</button>
+          <button class="read" type="button">读值</button>
+          <button class="commit" type="button">提交 COMMIT</button>
+          <button class="rollback" type="button">回滚 ROLLBACK</button>
+        </div>
+        <div class="add-row">
+          <input class="amount" type="number" step="1" inputmode="numeric" value="10" aria-label="甲栏加上的整数">
+          <button class="write add" type="button">加上输入整数</button>
+        </div>
+        <div class="error-box" role="alert"></div>
+        <ol class="logs"><li class="empty">暂无操作记录</li></ol>
+      </article>
+
+      <article class="pane" data-pane="b">
+        <div class="pane-head">
+          <h2>乙栏 / 连接 B</h2>
+          <span class="pill off transaction-badge">事务未开启</span>
+        </div>
+        <div class="status-row">
+          <div class="stat">
+            <span class="stat-label">最近一次显式读值</span>
+            <span class="read-value unknown">未读取</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">请求状态</span>
+            <span class="stat-value request-state">空闲</span>
+          </div>
+        </div>
+        <div class="controls">
+          <button class="begin" type="button">BEGIN DEFERRED</button>
+          <button class="read" type="button">读值</button>
+          <button class="commit" type="button">提交 COMMIT</button>
+          <button class="rollback" type="button">回滚 ROLLBACK</button>
+        </div>
+        <div class="add-row">
+          <input class="amount" type="number" step="1" inputmode="numeric" value="10" aria-label="乙栏加上输入整数">
+          <button class="write add" type="button">加上输入整数</button>
+        </div>
+        <div class="error-box" role="alert"></div>
+        <ol class="logs"><li class="empty">暂无操作记录</li></ol>
+      </article>
+    </section>
+
+    <section class="examples">
+      <h2>建议观察流程</h2>
+      <ol>
+        <li>甲：BEGIN DEFERRED → 读值，看到 <strong>100</strong>。</li>
+        <li>乙：BEGIN DEFERRED → 输入 10 → 加上输入整数 → COMMIT。</li>
+        <li>甲再次读值仍为 <strong>100</strong>；甲尝试加任意整数会立即得到 <strong>SQLITE_BUSY_SNAPSHOT / 517</strong>，事务仍保持开启。</li>
+        <li>甲 ROLLBACK 后重新 BEGIN DEFERRED 并读值，看到 <strong>110</strong>。</li>
+        <li>重新实验后：甲 BEGIN 后写入加 10 但不提交；乙 BEGIN 后尝试写入，立即得到 <strong>SQLITE_BUSY / 5</strong>。甲 ROLLBACK 后，乙可在同一失败事务中重试写入。</li>
+      </ol>
+    </section>
+  </main>
+
+  <script>
+    const state = {
+      experimentId: null,
+      server: null,
+      busy: { a: false, b: false, create: false, committed: false }
+    };
+
+    const $ = (selector, root = document) => root.querySelector(selector);
+    const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
+    const panes = {};
+
+    for (const element of $$(".pane")) {
+      panes[element.dataset.pane] = {
+        root: element,
+        buttons: $$("button", element),
+        input: $(".amount", element),
+        error: $(".error-box", element),
+        logs: $(".logs", element),
+        badge: $(".transaction-badge", element),
+        readValue: $(".read-value", element),
+        requestState: $(".request-state", element)
+      };
+    }
+
+    function showError(box, error) {
+      if (!error) {
+        box.classList.remove("show");
+        box.textContent = "";
+        return;
+      }
+
+      const name = error.sqlite_error_name || "错误";
+      const code = error.sqlite_error_code === undefined || error.sqlite_error_code === null
+        ? ""
+        : `（错误码 ${error.sqlite_error_code}）`;
+      box.innerHTML = `<strong>${name}${code}</strong>${error.error || "请求失败"}`;
+      box.classList.add("show");
+    }
+
+    function renderLogs(box, logs) {
+      if (!logs || logs.length === 0) {
+        box.innerHTML = '<li class="empty">暂无操作记录</li>';
+        return;
+      }
+
+      box.innerHTML = "";
+      for (const item of logs) {
+        const li = document.createElement("li");
+        li.className = item.ok ? "good" : "bad";
+        const time = document.createElement("time");
+        time.textContent = item.time;
+        const message = document.createElement("span");
+        message.textContent = item.message;
+        li.append(time, message);
+        box.append(li);
+      }
+      box.scrollTop = box.scrollHeight;
+    }
+
+    function setBusy(key, busy) {
+      state.busy[key] = busy;
+      updateControls();
+    }
+
+    function updateControls() {
+      const hasExperiment = Boolean(state.experimentId);
+      const anyPaneBusy = state.busy.a || state.busy.b;
+
+      $("#newExperiment").disabled = anyPaneBusy || state.busy.create;
+      $("#refreshState").disabled = !hasExperiment || anyPaneBusy || state.busy.create;
+      $("#refreshCommitted").disabled = !hasExperiment || anyPaneBusy || state.busy.create || state.busy.committed;
+
+      for (const key of ["a", "b"]) {
+        const paneState = state.server?.panes?.find(item => item.key === key);
+        const pane = panes[key];
+        const transactionOpen = paneState ? Boolean(paneState.in_transaction) : false;
+        const paneBusy = state.busy[key];
+
+        pane.buttons.forEach(button => button.disabled = paneBusy || !hasExperiment);
+        pane.input.disabled = paneBusy || !hasExperiment;
+        pane.requestState.textContent = paneBusy ? "请求进行中，本栏按钮已禁用" : "空闲";
+      }
+    }
+
+    function renderPane(data, key) {
+      const pane = panes[key];
+      if (data.busy) {
+        pane.badge.className = "pill busy transaction-badge";
+        pane.badge.textContent = "请求进行中";
+      } else if (data.in_transaction) {
+        pane.badge.className = "pill on transaction-badge";
+        pane.badge.textContent = "事务已开启";
+      } else {
+        pane.badge.className = "pill off transaction-badge";
+        pane.badge.textContent = "事务未开启";
+      }
+
+      if (data.last_read === null || data.last_read === undefined) {
+        pane.readValue.textContent = "未读取";
+        pane.readValue.className = "read-value unknown";
+      } else {
+        pane.readValue.textContent = String(data.last_read);
+        pane.readValue.className = "read-value";
+      }
+
+      renderLogs(pane.logs, data.logs);
+    }
+
+    function renderCommitted(committed) {
+      const value = $("#committedValue");
+      if (!committed || committed.last_read === null || committed.last_read === undefined) {
+        value.textContent = "未读取";
+        value.className = "committed-value unknown";
+      } else {
+        value.textContent = String(committed.last_read);
+        value.className = "committed-value";
+      }
+    }
+
+    function render() {
+      if (!state.server) {
+        $("#experimentState").textContent = state.experimentId
+          ? `实验 ${state.experimentId.slice(0, 8)}…`
+          : "尚未创建实验";
+        $("#journalMode").textContent = "journal_mode: 未初始化";
+        $("#journalMode").className = "pill off";
+        renderCommitted(null);
+        updateControls();
+        return;
+      }
+
+      $("#experimentState").textContent = `实验 ID：${state.server.experiment_id}`;
+      $("#journalMode").textContent = `journal_mode: ${state.server.journal_mode}`;
+      $("#journalMode").className = "pill on";
+
+      for (const data of state.server.panes) {
+        renderPane(data, data.key);
+      }
+      renderCommitted(state.server.committed);
+      updateControls();
+    }
+
+    async function requestJson(url, options = {}) {
+      const response = await fetch(url, {
+        headers: { "Content-Type": "application/json" },
+        ...options
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const error = new Error(data.error || `HTTP ${response.status}`);
+        Object.assign(error, data);
+        throw error;
+      }
+      return data;
+    }
+
+    async function createExperiment() {
+      $("#globalError").classList.remove("show");
+      setBusy("create", true);
+      try {
+        const data = await requestJson("/api/experiments", { method: "POST" });
+        state.experimentId = data.experiment_id;
+        state.server = data.state;
+        sessionStorage.setItem("sqliteIsolationExperimentId", data.experiment_id);
+        for (const key of ["a", "b"]) {
+          showError(panes[key].error, null);
+        }
+        render();
+      } catch (error) {
+        showError($("#globalError"), error);
+      } finally {
+        setBusy("create", false);
+      }
+    }
+
+    async function refreshState() {
+      if (!state.experimentId) return;
+      $("#globalError").classList.remove("show");
+      try {
+        const data = await requestJson(
+          `/api/experiments/${state.experimentId}/state`
+        );
+        state.server = data.state;
+        render();
+      } catch (error) {
+        sessionStorage.removeItem("sqliteIsolationExperimentId");
+        state.experimentId = null;
+        state.server = null;
+        showError($("#globalError"), error);
+        render();
+      }
+    }
+
+    async function paneAction(key, action, body) {
+      if (!state.experimentId || state.busy[key]) return;
+      const pane = panes[key];
+      showError(pane.error, null);
+      setBusy(key, true);
+      render();
+
+      try {
+        const options = { method: "POST" };
+        if (body !== undefined) options.body = JSON.stringify(body);
+        const data = await requestJson(
+          `/api/experiments/${state.experimentId}/panes/${key}/${action}`,
+          options
+        );
+        state.server = data.state;
+      } catch (error) {
+        showError(pane.error, error);
+      } finally {
+        setBusy(key, false);
+        render();
+      }
+    }
+
+    async function readCommitted() {
+      if (!state.experimentId || state.busy.committed) return;
+      $("#globalError").classList.remove("show");
+      setBusy("committed", true);
+      try {
+        const data = await requestJson(
+          `/api/experiments/${state.experimentId}/committed/read`,
+          { method: "POST" }
+        );
+        state.server = data.state;
+      } catch (error) {
+        showError($("#globalError"), error);
+      } finally {
+        setBusy("committed", false);
+        render();
+      }
+    }
+
+    function addAction(key) {
+      const raw = panes[key].input.value.trim();
+      if (!/^[+-]?\d+$/.test(raw)) {
+        showError(panes[key].error, { error: "请输入整数。", sqlite_error_name: "输入错误" });
+        return;
+      }
+      paneAction(key, "add", { amount: Number(raw) });
+    }
+
+    $("#newExperiment").addEventListener("click", createExperiment);
+    $("#refreshState").addEventListener("click", refreshState);
+    $("#refreshCommitted").addEventListener("click", readCommitted);
+
+    const restoredExperimentId = sessionStorage.getItem("sqliteIsolationExperimentId");
+    if (restoredExperimentId) {
+      state.experimentId = restoredExperimentId;
+      refreshState();
+    }
+
+    for (const key of ["a", "b"]) {
+      const root = panes[key].root;
+      $(".begin", root).addEventListener("click", () => paneAction(key, "begin"));
+      $(".read", root).addEventListener("click", () => paneAction(key, "read"));
+      $(".commit", root).addEventListener("click", () => paneAction(key, "commit"));
+      $(".rollback", root).addEventListener("click", () => paneAction(key, "rollback"));
+      $(".add", root).addEventListener("click", () => addAction(key));
+    }
+
+    render();
+  </script>
+</body>
+</html>
